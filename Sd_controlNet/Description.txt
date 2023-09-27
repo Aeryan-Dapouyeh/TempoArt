@@ -1,0 +1,1 @@
+Use controlnet hed to generate videos frame by frame.
