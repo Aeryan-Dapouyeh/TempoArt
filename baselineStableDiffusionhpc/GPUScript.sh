@@ -42,17 +42,21 @@ source miniconda3/etc/profile.d/conda.sh
 conda init bash
 conda activate BestEnv
 cd /work3/s204134/baselineStableDiffusionhpc
-python main.py
-"Van gogh style painting of a male dancer dancing, detailed"
-"Van gogh style painting of a man dancing, detailed"
-"Van gogh style painting of a black man laughing, detailed"
-"Van gogh style painting of a man with a headphone, detailed"
-"Van gogh style painting of woman running, detailed"
-"Van gogh style painting of woman running in the beach, detailed"
-"Van gogh style painting of a woman smiling, detailed"
-"Van gogh style painting of a woman, detailed"
-"Van gogh style painting of a woman working with her computer, detailed"
-"Van gogh style painting of a man walking in the desert, detailed"
+
+# Example of a scipt with Generate_baseline.py 
+python Generate_baseline.py -i "movieClips/BSVid.mp4" -o "BSVid_Baseline.mp4" -p "Van gogh style painting of a male dancer dancing, detailed" -c "/work3/s204158/HF_cache"
+
+### python main.py
+### "Van gogh style painting of a male dancer dancing, detailed"
+### "Van gogh style painting of a man dancing, detailed"
+### "Van gogh style painting of a black man laughing, detailed"
+### "Van gogh style painting of a man with a headphone, detailed"
+### "Van gogh style painting of woman running, detailed"
+### "Van gogh style painting of woman running in the beach, detailed"
+### "Van gogh style painting of a woman smiling, detailed"
+### "Van gogh style painting of a woman, detailed"
+### "Van gogh style painting of a woman working with her computer, detailed"
+### "Van gogh style painting of a man walking in the desert, detailed"
 
 
 
