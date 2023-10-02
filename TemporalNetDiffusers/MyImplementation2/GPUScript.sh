@@ -41,5 +41,14 @@ source miniconda3/etc/profile.d/conda.sh
 conda init bash
 conda activate DL_CompVision
 cd /zhome/70/6/155860/Bachlorproject/MyImplementation2
-python main.py
+python main.py -i "Input/BSVid.mp4" -p "Van gogh style painting of a male dancer dancing, detailed" -o "BSVid_Van_gogh.mp4"
+### python main.py -i "Input/DYVid.mp4" -p "Van gogh style painting of a man dancing, detailed" -o "DYVid_Van_gogh.mp4"
+python main.py -i "Input/LCVid.mp4" -p "Van gogh style painting of a black man laughing, detailed" -o "LCVid_Van_gogh.mp4"
+python main.py -i "Input/LMVid.mp4" -p "Van gogh style painting of a man with a headphone, detailed" -o "LMVid_Van_gogh.mp4"
+python main.py -i "Input/RSVid.mp4" -p "Van gogh style painting of woman running, detailed" -o "RSVid_Van_gogh.mp4"
+python main.py -i "Input/SBVid.mp4" -p "Van gogh style painting of woman running in the beach, detailed" -o "SBVid_Van_gogh.mp4"
+python main.py -i "Input/SCVid.mp4" -p "Van gogh style painting of a woman smiling, detailed" -o "SCVid_Van_gogh.mp4"
+python main.py -i "Input/SWVid.mp4" -p "Van gogh style painting of a woman, detailed" -o "SWVid_Van_gogh.mp4"
+python main.py -i "Input/WLVid.mp4" -p "Van gogh style painting of a woman working with her computer, detailed" -o "WLVid_Van_gogh.mp4"
+python main.py -i "Input/WWVid.mp4" -p "Van gogh style painting of a man walking in the desert, detailed" -o "WWVid_Van_gogh.mp4"
 
