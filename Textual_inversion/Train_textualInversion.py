@@ -19,16 +19,18 @@ from diffusers import (
 )
 
 
+## TODO: Wandb
+
 ### Dataset and dataloader
 ### To be done
 
-### We assume there is a folder called data
+### We assume there is a folder called Dataset
 ### Where there is a a folder for each datapoint
 ### The name of each datapoint folder is an index, e.g. 381 or 54325 
 ### Each datapoint folder contains 
 ### 1. The original frames F1 and F2, named F1.png and F2.png
 ### 2. Optical flow map of F1 and F2, named oF.png
-### 3. A json file with a prompt describing the images, named prompt.json
+### 3. A text file with a prompt describing the images, named prompt.txt
 class TextualInversionDataset(Dataset):
     def __init__(
             self,
@@ -46,20 +48,32 @@ class TextualInversionDataset(Dataset):
         currentDir = self.DataDir.path.join("{}".format(i))
         F1_path = os.path.join(currentDir, "F1.png")
         F2_path = os.path.join(currentDir, "F2.png")
-        Of_path = os.path.join(currentDir, "oF.png")
+        Of_path = os.path.join(currentDir, "Of.png")
+        prompt_path = os.path.join(currentDir, "prompt.txt")
 
         prompt = ""
 
-        with open(Of_path, 'r') as f:
-            prompt = json.load(f)
+        with open(prompt_path, 'r') as f:
+            prompt = f.read()
 
         F1 = read_image(F1_path)
         F2 = read_image(F2_path)
+        Of = read_image(Of_path)
 
-        return F1, F2, prompt
+        return F1, F2, Of, prompt
 
+# TODO: Add more necassary arguments according to the original train script
+# e.g. learnable property should be style
+
+DataDirectory = os.path.join(os.getcwd(),"Dataset")
+
+train_dataset = TextualInversionDataset(DataDir=DataDirectory)
+train_dataloader = torch.utils.data.DataLoader(
+    train_dataset, batch_size=4, shuffle=True #, num_workers=args.dataloader_num_workers
+)
 
 ### Model
+### TODO: Should be a hed controlnet
 
 model_id = "runwayml/stable-diffusion-v1-5"
 tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
