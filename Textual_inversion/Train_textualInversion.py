@@ -1,10 +1,12 @@
 import os
+import sys
 import numpy as np
 import math
 import safetensors
 import logging
 import torch
 import diffusers
+import shutil
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
@@ -42,14 +44,14 @@ logger = get_logger(__name__)
 ## TODO: Consider if the log_validation function in line 115 would be necassary
 
 ## TODO: We dont use args in this script so do something about it
-def save_progress(text_encoder, placeholder_token_ids, accelerator, args, save_path, safe_serialization=True):
+def save_progress(text_encoder, placeholder_token_ids, accelerator, placeholder_token, save_path, safe_serialization=True):
     logger.info("Saving embeddings")
     learned_embeds = (
         accelerator.unwrap_model(text_encoder)
         .get_input_embeddings()
         .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
     )
-    learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
+    learned_embeds_dict = {placeholder_token: learned_embeds.detach().cpu()}
 
     if safe_serialization:
         safetensors.torch.save_file(learned_embeds_dict, save_path, metadata={"format": "pt"})
@@ -83,7 +85,7 @@ class TextualInversionDataset(Dataset):
         return dir_count
     
     def __getitem__(self, i):
-        currentDir = self.DataDir.path.join("{}".format(i))
+        currentDir = os.path.join(self.DataDir, "{}".format(i))
         F1_path = os.path.join(currentDir, "F1.png")
         F2_path = os.path.join(currentDir, "F2.png")
         Of_path = os.path.join(currentDir, "Of.png")
@@ -358,13 +360,15 @@ progress_bar = tqdm(
 orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
 
 
-
 ### Training loop
 
-for epoch in range(0, 50):
+for epoch in range(first_epoch, num_train_epochs):
     text_encoder.train()
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(text_encoder):
+            # Size of the images are torch.Size([4, 3, 1024, 1024]), aka. they have the shape [b, c, H, W]
+            # Last element in batch is a tuple of length b="batch_length" with b prompts in it 
+            
             # Convert images to latent space
             latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample().detach()
             latents = latents * vae.config.scaling_factor
@@ -411,7 +415,102 @@ for epoch in range(0, 50):
                     index_no_updates
                 ] = orig_embeds_params[index_no_updates]
 
+        # Checks if the accelerator has performed an optimization step behind the scenes
+        save_steps = 500
+        no_safe_serialization = False
+        checkpointing_steps = 500
+        checkpoints_total_limit = 50
+        validation_prompt = "A man in van gogh style"
+        
+        if accelerator.sync_gradients:
+            images = []
+            progress_bar.update(1)
+            global_step += 1
+            if global_step % save_steps == 0:
+                weight_name = (
+                    f"learned_embeds-steps-{global_step}.bin"
+                    if no_safe_serialization
+                    else f"learned_embeds-steps-{global_step}.safetensors"
+                )
+                save_path = os.path.join(output_dir, weight_name)
+                save_progress(
+                    text_encoder,
+                    placeholder_token_ids,
+                    accelerator,
+                    placeholder_token,
+                    save_path,
+                    safe_serialization=not no_safe_serialization,
+                )
+
+            if accelerator.is_main_process:
+                if global_step % checkpointing_steps == 0:
+                    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                    if checkpoints_total_limit is not None:
+                        checkpoints = os.listdir(output_dir)
+                        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                        # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                        if len(checkpoints) >= checkpoints_total_limit:
+                            num_to_remove = len(checkpoints) - checkpoints_total_limit + 1
+                            removing_checkpoints = checkpoints[0:num_to_remove]
+
+                            logger.info(
+                                f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                            )
+                            logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                            for removing_checkpoint in removing_checkpoints:
+                                removing_checkpoint = os.path.join(output_dir, removing_checkpoint)
+                                shutil.rmtree(removing_checkpoint)
+
+                    save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved state to {save_path}")
+                
+                ### TODO: Maybe incorporate the log validation function
+                ### Also, make better sense to create a dictionary for args first 
+                
+                # if validation_prompt is not None and global_step % validation_steps == 0:
+                #     images = log_validation(
+                #         text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch
+                #     )
+        logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+        progress_bar.set_postfix(**logs)
+        accelerator.log(logs, step=global_step)
+
+        if global_step >= max_train_steps:
+            break
     ### TODO: At the end of each epoch, update the training loop such that the newly trained model is used
 
+# Create the pipeline using the trained modules and save it.
+accelerator.wait_for_everyone()
+if accelerator.is_main_process:
+    save_full_model = True
+    
+    if save_full_model:
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", ### TODO: This might have to be changed to a HED controlnet
+            text_encoder=accelerator.unwrap_model(text_encoder),
+            vae=vae,
+            unet=unet,
+            tokenizer=tokenizer,
+        )
+        pipeline.save_pretrained(output_dir)
+    # Save the newly trained embeddings
+    weight_name = "learned_embeds.bin" if no_safe_serialization else "learned_embeds.safetensors"
+    save_path = os.path.join(output_dir, weight_name)
+    save_progress(
+        text_encoder,
+        placeholder_token_ids,
+        accelerator,
+        placeholder_token,
+        save_path,
+        safe_serialization=not no_safe_serialization,
+    )
 
+accelerator.end_training()
+
+
+### TODO: Make variables into a config dictionary
 print("Done!")
