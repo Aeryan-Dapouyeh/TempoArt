@@ -21,8 +21,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from packaging import version
-
-
+from controlnet_aux import HEDdetector
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import (
     AutoencoderKL,
@@ -31,10 +30,12 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     StableDiffusionPipeline,
     UNet2DConditionModel,
+    ControlNetModel, 
+    StableDiffusionControlNetPipeline
 )
 
 ## Config
-train_batch_size = 4
+train_batch_size = 2
 
 
 ## TODO: Wandb
@@ -120,7 +121,7 @@ accelerator_project_config = ProjectConfiguration(project_dir=output_dir, loggin
 accelerator = Accelerator(
     gradient_accumulation_steps=1,
     mixed_precision="no",
-    log_with="wandb",
+    # log_with="wandb", ## TODO: Uncomment this lise to get wandb to work
     project_config=accelerator_project_config,
 )
 
@@ -146,18 +147,33 @@ set_seed(seed)
 ### Model
 ### TODO: Should be a hed controlnet
 
+controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed")
+CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+	"runwayml/stable-diffusion-v1-5", controlnet=controlnet
+)
+hed = HEDdetector.from_pretrained('lllyasviel/Annotators')
+
+'''tokenizer = CotrolNet_pipeline.tokenizer
+
+# Load scheduler and models
+noise_scheduler = CotrolNet_pipeline.scheduler
+text_encoder = CotrolNet_pipeline.text_encoder
+vae = CotrolNet_pipeline.vae
+unet = CotrolNet_pipeline.unet
+'''
+
+
+# model_id = "lllyasviel/sd-controlnet-hed"
 model_id = "runwayml/stable-diffusion-v1-5"
+
 tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 
 # Load scheduler and models
 noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
-text_encoder = CLIPTextModel.from_pretrained(
-    model_id, subfolder="text_encoder"
-)
+text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
 vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
-unet = UNet2DConditionModel.from_pretrained(
-    model_id, subfolder="unet"
-)
+# unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
+unet = CotrolNet_pipeline.unet
 
 placeholder_token = "<Spaghetti>"
 placeholder_tokens = [placeholder_token]
@@ -173,7 +189,7 @@ placeholder_tokens += additional_tokens
 num_added_tokens = tokenizer.add_tokens(placeholder_tokens)
 if num_added_tokens != num_vectors:
         raise ValueError(
-            f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
+            f"The tokenizer already contains the token {placeholder_token}. Please pass a different"
             " `placeholder_token` that is not already in the tokenizer."
         )
 
@@ -256,7 +272,7 @@ optimizer = torch.optim.AdamW(
 )
 
 validation_steps = 100
-max_train_steps = 5000
+max_train_steps = 500
 num_train_epochs = 100
 
 # Scheduler and math around the number of training steps.
@@ -366,11 +382,20 @@ for epoch in range(first_epoch, num_train_epochs):
     text_encoder.train()
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(text_encoder):
+            # Batch = F1, F2, OF, prompt
             # Size of the images are torch.Size([4, 3, 1024, 1024]), aka. they have the shape [b, c, H, W]
             # Last element in batch is a tuple of length b="batch_length" with b prompts in it 
             
+            
+            
+            # from torchvision.transforms.functional import pil_to_tensor
+            # images_HED = [hed(batch[1][i].permute(1, 2, 0).cpu()) for i in range(batch[1].shape[0])]
+            # images_HED = [pil_to_tensor(image) for image in images_HED]
+            # images_HED = torch.stack(images_HED).to("cuda")
+
+            '''            
             # Convert images to latent space
-            latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample().detach()
+            latents = vae.encode(batch[0].to(dtype=weight_dtype)).latent_dist.sample().detach()
             latents = latents * vae.config.scaling_factor
 
             # Sample noise that we'll add to the latents
@@ -385,7 +410,7 @@ for epoch in range(first_epoch, num_train_epochs):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch["input_ids"])[0].to(dtype=weight_dtype)
+            encoder_hidden_states = text_encoder(batch[3])[0].to(dtype=weight_dtype)
 
             # Predict the noise residual
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -397,6 +422,12 @@ for epoch in range(first_epoch, num_train_epochs):
                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            '''
+            
+            target = batch[2].float()
+            target.requires_grad_()
+            model_pred = batch[1].float()
+            model_pred.requires_grad_()
 
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -489,12 +520,12 @@ if accelerator.is_main_process:
     save_full_model = True
     
     if save_full_model:
-        pipeline = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", ### TODO: This might have to be changed to a HED controlnet
-            text_encoder=accelerator.unwrap_model(text_encoder),
+        pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+	    "runwayml/stable-diffusion-v1-5", controlnet=controlnet,
+        text_encoder=accelerator.unwrap_model(text_encoder),
             vae=vae,
             unet=unet,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer
         )
         pipeline.save_pretrained(output_dir)
     # Save the newly trained embeddings
