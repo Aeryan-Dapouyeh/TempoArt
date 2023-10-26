@@ -17,6 +17,8 @@ import torchvision.transforms as transforms
 from torchvision.io import read_image
 from torch.utils.data import Dataset
 import transformers
+from PIL import Image
+from torchvision.transforms.functional import pil_to_tensor
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -76,14 +78,53 @@ class TextualInversionDataset(Dataset):
     def __init__(
             self,
             DataDir,
-            sizeThreshhold = 512 # Height or width is bigger then divide the picture until its short enough
+            tokenizer,
+            size=512,
+            sizeThreshhold = 512 # TODO: Height or width is bigger then divide the picture until its short enough
     ):
         self.DataDir = DataDir
+        self.size = size
+        self.tokenizer = tokenizer
 
     def __len__(self):
         path = self.DataDir
         dir_count = sum(os.path.isdir(os.path.join(path, f)) for f in os.listdir(path))
         return dir_count
+    
+    def preprocessImage(self, ImgPath):
+        image = Image.open(ImgPath)
+
+        if not image.mode == "RGB":
+            image = image.convert("RGB")
+        
+        # default to score-sde preprocessing
+        img = np.array(image).astype(np.uint8)
+
+        
+        crop = min(img.shape[0], img.shape[1])
+        (
+            h,
+            w,
+        ) = (
+            img.shape[0],
+            img.shape[1],
+        )
+        img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
+
+        image = Image.fromarray(img)
+        
+        image = image.resize((512, 512))
+
+        flip_transform = transforms.RandomHorizontalFlip(p=0.5)
+
+        image = flip_transform(image)
+        image = np.array(image).astype(np.uint8)
+        image = (image / 127.5 - 1.0).astype(np.float32)
+
+        image = torch.from_numpy(image).permute(2, 0, 1)
+        
+        return image 
+
     
     def __getitem__(self, i):
         currentDir = os.path.join(self.DataDir, "{}".format(i))
@@ -96,23 +137,26 @@ class TextualInversionDataset(Dataset):
 
         with open(prompt_path, 'r') as f:
             prompt = f.read()
+        
+        prompt = self.tokenizer(
+            prompt,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0]
 
-        F1 = read_image(F1_path)
-        F2 = read_image(F2_path)
-        Of = read_image(Of_path)
+        # F1 = read_image(F1_path)
+        # F2 = read_image(F2_path)
+        # Of = read_image(Of_path)
+        F1 = self.preprocessImage(ImgPath=F1_path)
+        F2 = self.preprocessImage(ImgPath=F2_path)
+        Of = self.preprocessImage(ImgPath=Of_path)
 
         return F1, F2, Of, prompt
 
 # TODO: Add more necassary arguments according to the original train script
 # e.g. learnable property should be style
-
-DataDirectory = os.path.join(os.getcwd(),"Dataset")
-
-train_dataset = TextualInversionDataset(DataDir=DataDirectory)
-train_dataloader = torch.utils.data.DataLoader(
-    train_dataset, batch_size=train_batch_size, shuffle=True #, num_workers=args.dataloader_num_workers
-)
-
 
 output_dir = os.path.join(os.getcwd(), "output")
 logging_dir = os.path.join(output_dir, "logging")
@@ -179,6 +223,14 @@ placeholder_token = "<Spaghetti>"
 placeholder_tokens = [placeholder_token]
 # Number of embedding vectors to be used in the textual inversion model
 num_vectors = 1
+
+
+DataDirectory = os.path.join(os.getcwd(),"Dataset")
+
+train_dataset = TextualInversionDataset(DataDir=DataDirectory, tokenizer=tokenizer)
+train_dataloader = torch.utils.data.DataLoader(
+    train_dataset, batch_size=train_batch_size, shuffle=True #, num_workers=args.dataloader_num_workers
+)
 
 # add dummy tokens for multi-vector
 additional_tokens = []
@@ -386,14 +438,12 @@ for epoch in range(first_epoch, num_train_epochs):
             # Size of the images are torch.Size([4, 3, 1024, 1024]), aka. they have the shape [b, c, H, W]
             # Last element in batch is a tuple of length b="batch_length" with b prompts in it 
             
-            
-            
             # from torchvision.transforms.functional import pil_to_tensor
             # images_HED = [hed(batch[1][i].permute(1, 2, 0).cpu()) for i in range(batch[1].shape[0])]
             # images_HED = [pil_to_tensor(image) for image in images_HED]
             # images_HED = torch.stack(images_HED).to("cuda")
 
-            '''            
+            '''     
             # Convert images to latent space
             latents = vae.encode(batch[0].to(dtype=weight_dtype)).latent_dist.sample().detach()
             latents = latents * vae.config.scaling_factor
@@ -401,17 +451,30 @@ for epoch in range(first_epoch, num_train_epochs):
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-            # Sample a random timestep for each image
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-            timesteps = timesteps.long()
+            
 
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            '''
 
             # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(batch[3])[0].to(dtype=weight_dtype)
+    
 
+            images_HED = [hed(batch[1][i].permute(1, 2, 0).cpu()) for i in range(batch[1].shape[0])]
+            images_HED = [pil_to_tensor(image) for image in images_HED]
+            images_HED = torch.stack(images_HED)
+
+            CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder)
+            ### BIG TODO: Probably have to change num_inference_steps
+            StyledImages = CotrolNet_pipeline(prompt_embeds=encoder_hidden_states, image=images_HED, num_inference_steps=20).images[0]
+            # 1. Then generate the styled images for F0 too
+            # 2. And generate Of maps from that
+            # 3. The Of maps would be our modelPreds  
+
+            '''
             # Predict the noise residual
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
