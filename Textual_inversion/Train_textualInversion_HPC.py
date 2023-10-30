@@ -14,8 +14,10 @@ import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from torchvision.transforms import ToTensor
 from torchvision.io import read_image
 from torch.utils.data import Dataset
+from torchvision.models.optical_flow import raft_large
 import transformers
 from PIL import Image
 from torchvision.transforms.functional import pil_to_tensor
@@ -133,13 +135,13 @@ class TextualInversionDataset(Dataset):
         Of_path = os.path.join(currentDir, "Of.png")
         prompt_path = os.path.join(currentDir, "prompt.txt")
 
-        prompt = ""
+        Raw_prompt = ""
 
         with open(prompt_path, 'r') as f:
-            prompt = f.read()
-        
+            Raw_prompt = f.read()
+        ### COMMENT: OPTIMIZE THE PROMPT VECTOR INSTEAD 
         prompt = self.tokenizer(
-            prompt,
+            Raw_prompt,
             padding="max_length",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -153,7 +155,7 @@ class TextualInversionDataset(Dataset):
         F2 = self.preprocessImage(ImgPath=F2_path)
         Of = self.preprocessImage(ImgPath=Of_path)
 
-        return F1, F2, Of, prompt
+        return F1, F2, Of, prompt, Raw_prompt
 
 # TODO: Add more necassary arguments according to the original train script
 # e.g. learnable property should be style
@@ -185,17 +187,17 @@ else:
 
 ### TODO: it pains me to see this value not be 42
 seed = np.int64(42)
-set_seed(seed)
+set_seed(int(42))
 
 
 ### Model
 ### TODO: Should be a hed controlnet
 
-controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed")
+controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", cache_dir="/work3/s204158/HF_cache")
 CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-	"runwayml/stable-diffusion-v1-5", controlnet=controlnet
+	"runwayml/stable-diffusion-v1-5", controlnet=controlnet, cache_dir="/work3/s204158/HF_cache"
 )
-hed = HEDdetector.from_pretrained('lllyasviel/Annotators')
+hed = HEDdetector.from_pretrained('lllyasviel/Annotators', cache_dir="/work3/s204158/HF_cache")
 
 '''tokenizer = CotrolNet_pipeline.tokenizer
 
@@ -225,7 +227,7 @@ placeholder_tokens = [placeholder_token]
 num_vectors = 1
 
 
-DataDirectory = os.path.join(os.getcwd(),"Dataset")
+DataDirectory = os.path.join("/work3/s204158/TextualInv_Train","Dataset")
 
 train_dataset = TextualInversionDataset(DataDir=DataDirectory, tokenizer=tokenizer)
 train_dataloader = torch.utils.data.DataLoader(
@@ -434,10 +436,10 @@ for epoch in range(first_epoch, num_train_epochs):
     text_encoder.train()
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(text_encoder):
-            # Batch = F1, F2, OF, prompt
+            # Batch = F1, F2, OF, prompt, Raw_prompt
             # Size of the images are torch.Size([4, 3, 1024, 1024]), aka. they have the shape [b, c, H, W]
-            # Last element in batch is a tuple of length b="batch_length" with b prompts in it 
-
+            # Fourth elemen in batch is a tuple of length b="batch_length" with b prompts in it 
+            
             
             '''     
             # Convert images to latent space
@@ -455,20 +457,53 @@ for epoch in range(first_epoch, num_train_epochs):
             '''
 
             # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch[3])[0].to(dtype=weight_dtype)
+            # encoder_hidden_states = text_encoder(batch[3])[0].to(dtype=weight_dtype).to("cuda")
+            Rawprompts = batch[4]
     
 
-            images_HED = [hed(batch[1][i].permute(1, 2, 0).cpu()) for i in range(batch[1].shape[0])]
-            images_HED = [pil_to_tensor(image) for image in images_HED]
-            images_HED = torch.stack(images_HED)
+            images_HED_F1 = [hed(batch[0][i].permute(1, 2, 0).cpu()) for i in range(batch[0].shape[0])]
+            images_HED_F1 = [ToTensor()(image) for image in images_HED_F1]
+            images_HED_F1 = torch.stack(images_HED_F1).to("cuda")
+
+            images_HED_F2 = [hed(batch[1][i].permute(1, 2, 0).cpu()) for i in range(batch[1].shape[0])]
+            images_HED_F2 = [ToTensor()(image) for image in images_HED_F2]
+            images_HED_F2 = torch.stack(images_HED_F2).to("cuda")
+
+            ### DIMITRI'S COMMENT: IT WON'T BE NECASSARY TO STYLE THE FIRST FRAME HERE, AND MAYBE EVEN NOT THE SECOND FRAME
 
             CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder)
+	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, cache_dir="/work3/s204158/HF_cache").to("cuda")
+            
             ### BIG TODO: Probably have to change num_inference_steps
-            StyledImages = CotrolNet_pipeline(prompt_embeds=encoder_hidden_states, image=images_HED, num_inference_steps=20).images[0]
+            print(images_HED_F1.shape)
+            # StyledImages_F1 = [CotrolNet_pipeline(prompt=[Rawprompts[i]]*train_batch_size, image=image, num_inference_steps=20).images[0] for i, image in enumerate(images_HED_F1)]
+            # StyledImages_F2 = [CotrolNet_pipeline(prompt=[Rawprompts[i]]*train_batch_size, image=image, num_inference_steps=20).images[0] for i, image in enumerate(images_HED_F2)]
+            StyledImages_F1 = CotrolNet_pipeline(prompt=[Rawprompts[0]]*train_batch_size, image=images_HED_F1, num_inference_steps=20).images[0]
+            StyledImages_F2 = CotrolNet_pipeline(prompt=[Rawprompts[0]]*train_batch_size, image=images_HED_F2, num_inference_steps=20).images[0]
+
+            StyledImages_F1 = [ToTensor()(image) for image in StyledImages_F1]
+            StyledImages_F2 = [ToTensor()(image) for image in StyledImages_F2]
+            
+            StyledImages_F1 = torch.stack(StyledImages_F1).to("cuda")
+            StyledImages_F2 = torch.stack(StyledImages_F2).to("cuda")
+
             # 1. Then generate the styled images for F0 too
             # 2. And generate Of maps from that
             # 3. The Of maps would be our modelPreds  
+
+            # StyledImages_F1 = pil_to_tensor(StyledImages_F1)
+            # StyledImages_F2 = pil_to_tensor(StyledImages_F2)
+
+            # StyledImages_F1 = ToTensor()(StyledImages_F1).unsqueeze_(0).to("cuda")
+            # StyledImages_F2 = ToTensor()(StyledImages_F2).unsqueeze_(0).to("cuda")
+
+            # print(len(StyledImages_F1))
+            print(StyledImages_F1.shape)
+
+            StyledImages_F1 = torch.stack(StyledImages_F1)
+            StyledImages_F2 = torch.stack(StyledImages_F2)
+
+            
 
             '''
             # Predict the noise residual
@@ -482,6 +517,18 @@ for epoch in range(first_epoch, num_train_epochs):
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
             '''
+
+            Of_model = raft_large(pretrained=True, progress=False).to("cuda")
+            Of_model = Of_model.eval()
+
+            Of_Styled = Of_model(StyledImages_F1, StyledImages_F2)
+            ### DIMITRI'S COMMENT: Use the original images
+            Of_Original = Of_model(images_HED_F1, images_HED_F2)
+
+            ### DIMITRI'S COMMENT: Visualize how the optical flow looks like every n iterations
+
+            print(Of_Original.shape)
+            print(Of_Styled.shape)
             
             target = batch[2].float()
             target.requires_grad_()
