@@ -444,6 +444,10 @@ progress_bar = tqdm(
 # keep original embeddings as reference
 orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
 
+# Optical Flow model
+Of_model = raft_large(pretrained=True, progress=False).to("cuda")
+Of_model = Of_model.eval()
+
 
 ### Training loop
 
@@ -457,9 +461,17 @@ for epoch in range(first_epoch, num_train_epochs):
             F1, F2, Of, F1_Styled, prompt, Raw_prompt = batch
             
             ### DIMITRI'S COMMENT: IT WON'T BE NECASSARY TO STYLE THE FIRST FRAME HERE, AND MAYBE EVEN NOT THE SECOND FRAME
+            images_HED = [hed(F1[i].permute(1, 2, 0).cpu()) for i in range(F1.shape[0])]
 
-            # CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-	        #     "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, cache_dir="/work3/s204158/HF_cache").to("cuda")
+            CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, cache_dir="/work3/s204158/HF_cache").to("cuda")
+            
+            F2_styled = [CotrolNet_pipeline("Van gogh painting of a man dancing, masterpiece", image=image, num_inference_steps=20).images[0] for image in images_HED]
+            F2_styled = [pil_to_tensor(image) for image in F2_styled]
+            F2_styled = torch.stack(F2_styled).to("cuda")
+
+
+            # F2_styled = CotrolNet_pipeline("Van gogh painting of a cat, masterpiece"*total_batch_size, images_HED, num_inference_steps=20).images[0]
             # TODO: num_inference_steps should be modfied by the scheduler
             
             
@@ -469,15 +481,17 @@ for epoch in range(first_epoch, num_train_epochs):
             
 
             # Convert images to latent space
-            
+            '''
+            images_HED = hed(F2.cpu()).to("cuda")
+            images_HED = [pil_to_tensor(image) for image in images_HED]
+            images_HED = torch.stack(images_HED)
             # TODO: Remember to convert images to HED
             # images_HED = hed(F2)
             # images_HED = [pil_to_tensor(image) for image in images_HED]
             # images_HED = torch.stack(images_HED)
             print("F2 shape: ")
             print(F2.shape)
-
-            
+ 
             latents = vae.encode(F2.to(dtype=weight_dtype)).latent_dist.sample().detach()
             latents = latents * vae.config.scaling_factor
 
@@ -521,9 +535,7 @@ for epoch in range(first_epoch, num_train_epochs):
             print(F2_styled)
             print("F2_styled shape: ")
             print(F2_styled.shape)
-
-            Of_model = raft_large(pretrained=True, progress=False).to("cuda")
-            Of_model = Of_model.eval()
+            '''
 
             Of_Styled = Of_model(F1_Styled, F2_styled)[-1]
             Of_Original = Of_model(F1, F2)[-1]
