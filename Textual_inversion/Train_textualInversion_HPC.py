@@ -198,6 +198,8 @@ set_seed(int(42))
 ### Model
 ### TODO: Should be a hed controlnet
 
+
+
 if HPC:
     controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", cache_dir="/work3/s204158/HF_cache")
     CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
@@ -211,31 +213,29 @@ else:
     hed = HEDdetector.from_pretrained('lllyasviel/Annotators')
 
 
-
-'''tokenizer = CotrolNet_pipeline.tokenizer
-
-# Load scheduler and models
-noise_scheduler = CotrolNet_pipeline.scheduler
-text_encoder = CotrolNet_pipeline.text_encoder
-vae = CotrolNet_pipeline.vae
-unet = CotrolNet_pipeline.unet
-'''
-
-
 # model_id = "lllyasviel/sd-controlnet-hed"
 model_id = "runwayml/stable-diffusion-v1-5"
 
 tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-
 # Load scheduler and models
 noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
 vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
-# unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
-unet = CotrolNet_pipeline.unet
+unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
+
+
+
+# tokenizer = CotrolNet_pipeline.tokenizer
+# Load scheduler and models
+# noise_scheduler = CotrolNet_pipeline.scheduler
+# text_encoder = CotrolNet_pipeline.text_encoder
+# vae = CotrolNet_pipeline.vae
+# unet = CotrolNet_pipeline.unet
+
+
 
 # TODO: This has to be the new word
-placeholder_token = "<Spaghetti>"
+placeholder_token = "<Temporally_consistent>"
 placeholder_tokens = [placeholder_token]
 # Number of embedding vectors to be used in the textual inversion model
 num_vectors = 1
@@ -313,6 +313,7 @@ if enable_xformers_memory_efficient_attention:
                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
             )
         unet.enable_xformers_memory_efficient_attention()
+        controlnet.enable_xformers_memory_efficient_attention()
     else:
         raise ValueError("xformers is not available. Make sure it is installed correctly")
 
@@ -364,8 +365,8 @@ lr_scheduler = get_scheduler(
 
 
 # Prepare everything with our `accelerator`.
-text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-    text_encoder, optimizer, train_dataloader, lr_scheduler
+controlnet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    controlnet, text_encoder, optimizer, train_dataloader, lr_scheduler
 )
 
 # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -451,80 +452,84 @@ for epoch in range(first_epoch, num_train_epochs):
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(text_encoder):
             # Batch = F1, F2, Of, F1_Styled, prompt, Raw_prompt
-            # Size of the images are torch.Size([4, 3, 1024, 1024]), aka. they have the shape [b, c, H, W]
+            # Size of the images are torch.Size([4, 3, 512, 512]), aka. they have the shape [b, c, H, W]
             # Fifth element in batch is a tuple of length b="batch_length" with b prompts in it 
             F1, F2, Of, F1_Styled, prompt, Raw_prompt = batch
             
-            '''     
-            # Convert images to latent space
-            latents = vae.encode(batch[0].to(dtype=weight_dtype)).latent_dist.sample().detach()
-            latents = latents * vae.config.scaling_factor
-
-            # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
-            
-
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            '''
-
-
             ### DIMITRI'S COMMENT: IT WON'T BE NECASSARY TO STYLE THE FIRST FRAME HERE, AND MAYBE EVEN NOT THE SECOND FRAME
 
-            CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, cache_dir="/work3/s204158/HF_cache").to("cuda")
+            # CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+	        #     "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, cache_dir="/work3/s204158/HF_cache").to("cuda")
             # TODO: num_inference_steps should be modfied by the scheduler
             
             
             # 1. Then generate the styled images for F1
             # 2. And generate Of maps from that
             # 3. The Of maps would be our modelPreds  
-            print("prompt_embeds: ")
-            print(prompt)
+            
 
+            # Convert images to latent space
+            
+            # TODO: Remember to convert images to HED
+            # images_HED = hed(F2)
+            # images_HED = [pil_to_tensor(image) for image in images_HED]
+            # images_HED = torch.stack(images_HED)
             print("F2 shape: ")
             print(F2.shape)
 
-            print("prompt_embeds shape: ")
-            print(prompt.shape)
-
-            print("prompt: ")
-            print(Raw_prompt)
-
-            print("Raw_prompt length: ")
-            print(len(Raw_prompt))
             
-            F2_Styled = CotrolNet_pipeline(prompt=list(Raw_prompt), image=F2, num_inference_steps=20).images[0]
+            latents = vae.encode(F2.to(dtype=weight_dtype)).latent_dist.sample().detach()
+            latents = latents * vae.config.scaling_factor
 
-            print("F2_Styled: ")
-            print(F2_Styled)
+            # Sample noise that we'll add to the latents
+            noise = torch.randn_like(latents)
+            bsz = latents.shape[0]
+            # Sample a random timestep for each image
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
 
-            print("F2_Styled shape: ")            
-            print(F2_Styled.shape)
+            # Add noise to the latents according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            '''
+            # Get the text embedding for conditioning
+            encoder_hidden_states = text_encoder(prompt)[0]
+
+            controlnet_image = F1_Styled.to(dtype=weight_dtype)
+
+            down_block_res_samples, mid_block_res_sample = controlnet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                controlnet_cond=controlnet_image,
+                return_dict=False,
+            )
+
             # Predict the noise residual
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            F2_styled = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                down_block_additional_residuals=[
+                    sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                ],
+                mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+            ).sample
 
-            # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            '''
+
+            print("F2_styled: ")
+            print(F2_styled)
+            print("F2_styled shape: ")
+            print(F2_styled.shape)
 
             Of_model = raft_large(pretrained=True, progress=False).to("cuda")
             Of_model = Of_model.eval()
 
-            Of_Styled = Of_model(F1_Styled, F2_Styled)
-            Of_Original = Of_model(F1, F2)
+            Of_Styled = Of_model(F1_Styled, F2_styled)[-1]
+            Of_Original = Of_model(F1, F2)[-1]
 
             ### DIMITRI'S COMMENT: Visualize how the optical flow looks like every n iterations
-            
+
             target = Of_Original.float()
             target.requires_grad_()
             model_pred = Of_Styled.float()
