@@ -1,5 +1,6 @@
 import os
 import sys
+import wandb
 import numpy as np
 import math
 import safetensors
@@ -40,6 +41,14 @@ from diffusers import (
 
 ## Config
 train_batch_size = 2
+scale_lr = False
+learning_rate = 1e-4
+gradient_accumulation_steps = 1
+validation_steps = 100
+max_train_steps = 500
+num_train_epochs = 100
+
+
 HPC = True
 
 if HPC:
@@ -48,7 +57,22 @@ else:
     cache_dir = "/work3/s204158/HF_cache"
 
 
-## TODO: Wandb
+## Wandb
+
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="BachlorProjekt",
+    
+    # track hyperparameters and run metadata
+    config={
+    "learning_rate": learning_rate,
+    "architecture": "HedControlNet",
+    "dataset": "Costume_DYVid.mp4",
+    "epochs": num_train_epochs,
+    }
+)
+
+
 
 logger = get_logger(__name__)
 
@@ -165,7 +189,11 @@ class TextualInversionDataset(Dataset):
 # TODO: Add more necassary arguments according to the original train script
 # e.g. learnable property should be style
 
-output_dir = os.path.join(os.getcwd(), "output")
+if HPC: 
+    output_dir = "/work3/s204158/TextualInv_Train/output"
+else:
+    output_dir = os.path.join(os.getcwd(), "output")
+    
 logging_dir = os.path.join(output_dir, "logging")
 
 accelerator_project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
@@ -321,9 +349,7 @@ allow_tf32 = True
 if allow_tf32:
     torch.backends.cuda.matmul.allow_tf32 = True
 
-scale_lr = False
-learning_rate = 1e-4
-gradient_accumulation_steps = 1
+
 
 
 if scale_lr:
@@ -339,10 +365,6 @@ optimizer = torch.optim.AdamW(
         weight_decay=1e-2,
         eps=1e-08,
 )
-
-validation_steps = 100
-max_train_steps = 500
-num_train_epochs = 100
 
 # Scheduler and math around the number of training steps.
 overrode_max_train_steps = False
@@ -625,6 +647,8 @@ for epoch in range(first_epoch, num_train_epochs):
                 #         text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch
                 #     )
         logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+        # log metrics to wandb
+        wandb.log({"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]})
         progress_bar.set_postfix(**logs)
         accelerator.log(logs, step=global_step)
 
@@ -659,6 +683,7 @@ if accelerator.is_main_process:
     )
 
 accelerator.end_training()
+wandb.finish()
 
 
 ### TODO: Make variables into a config dictionary
