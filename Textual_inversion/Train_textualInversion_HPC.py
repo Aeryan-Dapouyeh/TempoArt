@@ -587,7 +587,7 @@ for epoch in range(first_epoch, num_train_epochs):
             F1, F2, Of, F1_Styled, prompt, Raw_prompt = batch
             
             ### DIMITRI'S COMMENT: IT WON'T BE NECASSARY TO STYLE THE FIRST FRAME HERE, AND MAYBE EVEN NOT THE SECOND FRAME
-            images_HED = [hed(F1[i].permute(1, 2, 0).cpu()) for i in range(F1.shape[0])]
+            images_HED = [hed(F2[i].permute(1, 2, 0).cpu()) for i in range(F2.shape[0])]
 
             generator = torch.Generator(device=accelerator.device).manual_seed(42)
             CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(

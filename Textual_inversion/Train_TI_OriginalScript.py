@@ -33,6 +33,10 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
+from torchvision.utils import save_image
+from torchvision.transforms.functional import pil_to_tensor
+from controlnet_aux import HEDdetector
+from torchvision.models.optical_flow import raft_large
 
 # TODO: remove and import from diffusers.utils when the new version of diffusers is released
 from packaging import version
@@ -51,14 +55,29 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
     ControlNetModel,
+    StableDiffusionControlNetPipeline,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 
-if is_wandb_available():
-    import wandb
+import wandb
+
+
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="BachlorProjekt",
+    
+    # track hyperparameters and run metadata
+    config={
+    "learning_rate": 0.0001,
+    "architecture": "HedControlNet implemented from scratch in the training loop",
+    "dataset": "Costume_DYVid.mp4",
+    "Max steps": 3000,
+    }
+)
+
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -535,7 +554,6 @@ class TextualInversionDataset(Dataset):
         
         # default to score-sde preprocessing
         img = np.array(img).astype(np.uint8)
-        print(img.shape)
 
         if self.center_crop:
             crop = min(img.shape[0], img.shape[1])
@@ -554,7 +572,6 @@ class TextualInversionDataset(Dataset):
         img = self.flip_transform(img)
         img = np.array(img).astype(np.uint8)
         img = (img / 127.5 - 1.0).astype(np.float32)
-        print(img.shape)
 
         return img
 
@@ -656,8 +673,28 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
+
+    
     # TODO: COnsider passing the controlnetname as an argument
     controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", cache_dir="/work3/s204158/HF_cache")
+
+    CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+    	"runwayml/stable-diffusion-v1-5", controlnet=controlnet, cache_dir="/work3/s204158/HF_cache"
+    )
+
+    hed = HEDdetector.from_pretrained('lllyasviel/Annotators', cache_dir="/work3/s204158/HF_cache")
+
+    tokenizer = CotrolNet_pipeline.tokenizer
+    # Load scheduler and models
+    noise_scheduler = CotrolNet_pipeline.scheduler
+    text_encoder = CotrolNet_pipeline.text_encoder
+    vae = CotrolNet_pipeline.vae
+    unet = CotrolNet_pipeline.unet
+
+    # Optical Flow model
+    Of_model = raft_large(pretrained=True, progress=False).to("cuda")
+    Of_model = Of_model.eval()
+
     # Add the placeholder token in tokenizer
     placeholder_tokens = [args.placeholder_token]
 
@@ -867,8 +904,19 @@ def main():
         text_encoder.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(text_encoder):
+                
+
+                Of = batch["Of"]
+                F1_styled = batch["F1_styled"]
+                F1 = batch["F1"]
+                F2 = batch["F2"]
+
+                F2_HED = [hed(F2[i].permute(1, 2, 0).cpu()) for i in range(F2.shape[0])]
+                F2_HED = torch.stack([pil_to_tensor(image) for image in F2_HED]).to("cuda")
+                print(F2_HED.shape)
+
                 # Convert images to latent space
-                latents = vae.encode(batch["F2"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(F2_HED.to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -898,7 +946,7 @@ def main():
                 )
 
                 # Predict the noise residual
-                model_pred = unet(
+                ResultingImg = unet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
@@ -908,13 +956,31 @@ def main():
                     mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
                 ).sample
 
+                ResultingImg = 1 / vae.config.scaling_factor * ResultingImg
+                
+                ResultingImg = vae.decode(ResultingImg).sample
+                
+                
+                # save_image(ResultingImg, 'Resulting_Img.png')
+
+
                 # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                # if noise_scheduler.config.prediction_type == "epsilon":
+                #     target = noise
+                # elif noise_scheduler.config.prediction_type == "v_prediction":
+                #     target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                # else:
+                #     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                
+
+                
+                F2_styled = ResultingImg
+
+                Of_Styled = Of_model(F1_styled, F2_styled)[-1]
+                Of_Original = Of_model(F1, F2)[-1]
+                target = Of_Styled
+                model_pred = Of_Original
+
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
@@ -985,6 +1051,7 @@ def main():
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            wandb.log({"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]})
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -1035,6 +1102,7 @@ def main():
             )
 
     accelerator.end_training()
+    wandb.finish()
 
 # Run the script by: 
 '''
