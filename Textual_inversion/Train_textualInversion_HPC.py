@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torchvision.transforms import ToTensor
 from torchvision.io import read_image
+from torchvision.io.video import read_video, write_video
 from torch.utils.data import Dataset
 from torchvision.models.optical_flow import raft_large
 import transformers
@@ -40,12 +41,12 @@ from diffusers import (
 )
 
 ## Config
-train_batch_size = 2
+train_batch_size = 4
 scale_lr = False
 learning_rate = 1e-4
 gradient_accumulation_steps = 1
 validation_steps = 100
-max_train_steps = 500
+max_train_steps = 3000
 num_train_epochs = 100
 
 
@@ -76,7 +77,107 @@ wandb.init(
 
 logger = get_logger(__name__)
 
-## TODO: Consider if the log_validation function in line 115 would be necassary
+def saveAsVid(Vid_Array, name, outputDir):
+    output_video_pytorch = []
+    # outputDir = os.getcwd()
+    outputDir = os.path.join(outputDir, "videos/{}.mp4".format(name))
+    for frame in Vid_Array:
+        img = frame
+        img_array = np.array(img)
+        tensor = torch.from_numpy(img_array)
+        output_video_pytorch.append(tensor)
+    
+    output_video_pytorch = torch.stack(output_video_pytorch)
+    write_video(outputDir, output_video_pytorch)
+
+
+def log_validation(text_encoder, tokenizer, unet, vae, accelerator, weight_dtype, epoch, prompt, validationDir, currentIteration, outPutDir):
+    validation_prompt = "{}, {}".format(prompt, "Temporally_consistent")
+    
+    num_validation_images = sum(os.path.isdir(os.path.join(validationDir, f)) for f in os.listdir(validationDir))
+
+    logger.info(
+        f"Running validation... \n Generating {num_validation_images} images with prompt:"
+        f" {validation_prompt}."
+    )
+    
+    # create pipeline (note: unet and vae are loaded again in float32)
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        controlnet=controlnet,
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        tokenizer=tokenizer,
+        unet=unet,
+        vae=vae,
+        safety_checker=None,
+        # revision=args.revision, # CONSIDER: if this might improve the model
+        torch_dtype=weight_dtype,
+        cache_dir="/work3/s204158/HF_cache",
+    ).to("cuda")
+    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    # run inference
+    seed = 42
+    generator = torch.Generator(device=accelerator.device).manual_seed(seed)
+    validation_images = []
+    losses = []
+    Of_Styled = []
+    Of_Original = []
+    
+    for _, batch in enumerate(train_dataloader):
+        with torch.autocast("cuda"): 
+            F1, F2, Of, F1_Styled, prompt, Raw_prompt = batch
+            images_HED = hed(F1.permute(1, 2, 0).cpu())
+            F2_styled = [pipeline(validation_prompt, image=image, num_inference_steps=20, generator=generator).images[0] for image in images_HED]
+            # Add validation images to the iamges
+            for image in F2_styled:
+                validation_images.append(image)
+            F2_styled = [pil_to_tensor(image) for image in F2_styled]
+            F2_styled = torch.stack(F2_styled).to("cuda")
+            
+            Of_Styled = Of_model(F1_Styled, F2_styled)[-1]
+            Of_Original = Of_model(F1, F2)[-1]
+
+            ### DIMITRI'S COMMENT: Visualize how the optical flow looks like every n iterations
+
+            target = Of_Original.float()
+            target.requires_grad_()
+            model_pred = Of_Styled.float()
+            model_pred.requires_grad_()
+
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            losses.append(loss)
+            Of_Styled.append(Of_Styled)
+            Of_Original.append(Of_Original)
+            
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    "validation": [
+                        wandb.Image(image, caption=f"{i}: {validation_prompt}") for i, image in enumerate(images)
+                    ]
+                }
+            )
+    
+    avg_loss = np.mean(losses)
+
+    #### Get the path for videoOutputs
+    saveAsVid(Of_Styled, "Of_Styled_{}".format(currentIteration), outPutDir)
+    saveAsVid(Of_Original, "Of_Original_{}".format(currentIteration), outPutDir)
+    saveAsVid(validation_images, "validation_images_{}".format(currentIteration), outPutDir)
+
+    del pipeline
+    torch.cuda.empty_cache()
+    return avg_loss
+
+
 
 ## TODO: We dont use args in this script so do something about it
 def save_progress(text_encoder, placeholder_token_ids, accelerator, placeholder_token, save_path, safe_serialization=True):
@@ -106,6 +207,7 @@ def save_progress(text_encoder, placeholder_token_ids, accelerator, placeholder_
 ### 1. The original frames F1 and F2, named F1.png and F2.png
 ### 2. Optical flow map of F1 and F2, named oF.png
 ### 3. A text file with a prompt describing the images, named prompt.txt
+### 4. The styled image of F1, named F1_Styled.png
 class TextualInversionDataset(Dataset):
     def __init__(
             self,
@@ -170,7 +272,7 @@ class TextualInversionDataset(Dataset):
 
         with open(prompt_path, 'r') as f:
             Raw_prompt = f.read()
-        ### COMMENT: OPTIMIZE THE PROMPT VECTOR INSTEAD 
+        ### DIMITRI's COMMENT: OPTIMIZE THE PROMPT VECTOR INSTEAD 
         prompt = self.tokenizer(
             Raw_prompt,
             padding="max_length",
@@ -218,15 +320,9 @@ else:
     transformers.utils.logging.set_verbosity_error()
     diffusers.utils.logging.set_verbosity_error()
 
-### TODO: it pains me to see this value not be 42
-seed = np.int64(42)
 set_seed(int(42))
 
-
 ### Model
-### TODO: Should be a hed controlnet
-
-
 
 if HPC:
     controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", cache_dir="/work3/s204158/HF_cache")
@@ -270,14 +366,21 @@ num_vectors = 1
 
 
 if HPC: 
-    DataDirectory = os.path.join("/work3/s204158/TextualInv_Train","Dataset")
+    DataDirectory = os.path.join("/work3/s204158/TextualInv_Train","Dataset/train")
+    ValidationDirectory = os.path.join("/work3/s204158/TextualInv_Train","Dataset/validation")
 else: 
-    DataDirectory = os.path.join(os.getcwd(), "Dataset")
+    DataDirectory = os.path.join(os.getcwd(), "Dataset/train")
+    ValidationDirectory = os.path.join(os.getcwd(), "Dataset/validation")
 
 train_dataset = TextualInversionDataset(DataDir=DataDirectory, tokenizer=tokenizer)
+# validation_dataset = TextualInversionDataset(DataDir=ValidationDirectory, tokenizer=tokenizer)
+
 train_dataloader = torch.utils.data.DataLoader(
     train_dataset, batch_size=train_batch_size, shuffle=True #, num_workers=args.dataloader_num_workers
 )
+# validation_dataloader = torch.utils.data.DataLoader(
+#     validation_dataset, batch_size=train_batch_size, shuffle=True #, num_workers=args.dataloader_num_workers
+# )
 
 # add dummy tokens for multi-vector
 additional_tokens = []
@@ -294,7 +397,7 @@ if num_added_tokens != num_vectors:
 
 
 # Convert the initializer_token, placeholder_token to ids
-initializer_token = "Monet"
+initializer_token = "Consistent"
 token_ids = tokenizer.encode(initializer_token, add_special_tokens=False)
 # Check if initializer_token is a single token or a sequence of tokens
 if len(token_ids) > 1:
@@ -476,6 +579,7 @@ Of_model = Of_model.eval()
 for epoch in range(first_epoch, num_train_epochs):
     text_encoder.train()
     for step, batch in enumerate(train_dataloader):
+        print("Step {} of epoch {}.".format(step, epoch))
         with accelerator.accumulate(text_encoder):
             # Batch = F1, F2, Of, F1_Styled, prompt, Raw_prompt
             # Size of the images are torch.Size([4, 3, 512, 512]), aka. they have the shape [b, c, H, W]
@@ -485,10 +589,13 @@ for epoch in range(first_epoch, num_train_epochs):
             ### DIMITRI'S COMMENT: IT WON'T BE NECASSARY TO STYLE THE FIRST FRAME HERE, AND MAYBE EVEN NOT THE SECOND FRAME
             images_HED = [hed(F1[i].permute(1, 2, 0).cpu()) for i in range(F1.shape[0])]
 
+            generator = torch.Generator(device=accelerator.device).manual_seed(42)
             CotrolNet_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, cache_dir="/work3/s204158/HF_cache").to("cuda")
+	            "runwayml/stable-diffusion-v1-5", controlnet=controlnet, text_encoder=text_encoder, generator=generator, cache_dir="/work3/s204158/HF_cache").to("cuda")
             
-            F2_styled = [CotrolNet_pipeline("Van gogh painting of a man dancing, masterpiece", image=image, num_inference_steps=20).images[0] for image in images_HED]
+            # TODO Try instead to give the prompt to the encoder
+            # TODO: Write the loop with enumerate so that it gets Raw_prompt[i]
+            F2_styled = [CotrolNet_pipeline(Raw_prompt[0], image=image, num_inference_steps=20).images[0] for image in images_HED]
             F2_styled = [pil_to_tensor(image) for image in F2_styled]
             F2_styled = torch.stack(F2_styled).to("cuda")
 
@@ -591,7 +698,8 @@ for epoch in range(first_epoch, num_train_epochs):
         no_safe_serialization = False
         checkpointing_steps = 500
         checkpoints_total_limit = 50
-        validation_prompt = "A man in van gogh style"
+        # TODO: Write this properly
+        validation_prompt = "A man in van gogh style, temporally_consistent"
         
         if accelerator.sync_gradients:
             images = []
