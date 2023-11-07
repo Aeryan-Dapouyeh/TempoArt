@@ -17,6 +17,7 @@ import argparse
 import logging
 import math
 import os
+import PIL
 import random
 import shutil
 from pathlib import Path
@@ -26,11 +27,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch.utils.data import Dataset
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
+# from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
@@ -56,7 +58,7 @@ if is_wandb_available():
     import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.22.0.dev0")
+# check_min_version("0.22.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -87,6 +89,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         safety_checker=None,
         revision=args.revision,
         torch_dtype=weight_dtype,
+        cache_dir = "/work3/s204158/HF_cache"
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
@@ -176,6 +179,8 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=revision,
+        cache_dir = "/work3/s204158/HF_cache"
+
     )
     model_class = text_encoder_config.architectures[0]
 
@@ -260,12 +265,12 @@ def parse_args(input_args=None):
         default=None,
         help="Pretrained tokenizer name or path if not the same as model_name",
     )
-    parser.add_argument(
+    '''parser.add_argument(
         "--output_dir",
         type=str,
         default="controlnet-model",
         help="The output directory where the model predictions and checkpoints will be written.",
-    )
+    )'''
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -460,21 +465,21 @@ def parse_args(input_args=None):
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
-    parser.add_argument(
+    '''parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
-    )
-    parser.add_argument(
+    )'''
+    '''parser.add_argument(
         "--conditioning_image_column",
         type=str,
         default="conditioning_image",
         help="The column of the dataset containing the controlnet conditioning image.",
-    )
-    parser.add_argument(
+    )'''
+    '''parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
         help="The column of the dataset containing a caption or a list of captions.",
-    )
+    )'''
     parser.add_argument(
         "--max_train_samples",
         type=int,
@@ -579,6 +584,91 @@ def parse_args(input_args=None):
     return args
 
 
+class ControlNetDataSet(Dataset):
+    def __init__(
+        self,
+        data_root,
+        tokenizer,
+        size=512,
+        repeats=100,
+        flip_p=0.5,
+        center_crop=False,
+    ):
+        self.data_root = data_root
+        self.tokenizer = tokenizer
+        self.size = size
+        self.center_crop = center_crop
+        self.flip_p = flip_p
+
+        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+
+        self.num_images = len(self.image_paths)
+        self._length = self.num_images
+
+        self.interpolation = PIL.Image.Resampling.BILINEAR
+        self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
+
+        self.image_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+        )
+
+        self.conditioning_image_transforms = transforms.Compose(
+            [
+                transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(args.resolution),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def __len__(self):
+        path = self.data_root
+        dir_count = sum(os.path.isdir(os.path.join(path, f)) for f in os.listdir(path))
+        return dir_count
+    
+
+    def preprocessImage(self, ImgPath, Image_transforms):
+        image = Image.open(ImgPath)
+        image.convert("RGB")
+        image = Image_transforms(image)
+
+        return image
+    
+    
+    def __getitem__(self, i):
+        currentDir = os.path.join(self.data_root, "{}".format(i))
+        F1_path = os.path.join(currentDir, "F1.png")
+        F2_path = os.path.join(currentDir, "F2.png")
+        Of_path = os.path.join(currentDir, "Of.png")
+        F1_Styled_path = os.path.join(currentDir, "F1_Styled.png")
+        prompt_path = os.path.join(currentDir, "prompt.txt")
+
+        Raw_prompt = ""
+
+        with open(prompt_path, 'r') as f:
+            Raw_prompt = f.read()
+
+
+        prompt = self.tokenizer(
+            Raw_prompt,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        F1 = self.preprocessImage(ImgPath=F1_path, Image_transforms=self.conditioning_image_transforms)
+        F2 = self.preprocessImage(ImgPath=F2_path, Image_transforms=self.image_transforms)
+        F1_Styled = self.preprocessImage(ImgPath=F1_Styled_path, Image_transforms=self.image_transforms)
+        Of = self.preprocessImage(ImgPath=Of_path, Image_transforms=self.image_transforms)
+
+        return F1, F2, Of, F1_Styled, prompt, Raw_prompt
+
+'''
 def make_train_dataset(args, tokenizer, accelerator):
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -708,12 +798,14 @@ def collate_fn(examples):
         "conditioning_pixel_values": conditioning_pixel_values,
         "input_ids": input_ids,
     }
-
+'''
 
 def main(args):
-    logging_dir = Path(args.output_dir, args.logging_dir)
+    # logging_dir = Path(args.output_dir, args.logging_dir)
+    logging_dir = "/work3/s204158/ControlNetTrain_With_originalScript/logging"
+    output_dir = "/work3/s204158/ControlNetTrain_With_originalScript/output"
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -742,12 +834,12 @@ def main(args):
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
 
         if args.push_to_hub:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=args.hub_model_id or Path(output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
     # Load the tokenizer
@@ -759,6 +851,7 @@ def main(args):
             subfolder="tokenizer",
             revision=args.revision,
             use_fast=False,
+            cache_dir = "/work3/s204158/HF_cache"
         )
 
     # import correct text encoder class
@@ -776,7 +869,7 @@ def main(args):
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path, cache_dir = "/work3/s204158/HF_cache")
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
@@ -803,7 +896,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet", cache_dir = "/work3/s204158/HF_cache")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -878,14 +971,25 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = make_train_dataset(args, tokenizer, accelerator)
+    # train_dataset = make_train_dataset(args, tokenizer, accelerator)
+
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     shuffle=True,
+    #     collate_fn=collate_fn,
+    #     batch_size=args.train_batch_size,
+    #     num_workers=args.dataloader_num_workers,
+    # )
+
+    # Dataset and DataLoaders creation:
+    train_dataset = ControlNetDataSet(
+        data_root=args.train_data_dir,
+        tokenizer=tokenizer,
+        size=args.resolution,
+    )
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )
 
     # Scheduler and math around the number of training steps.
@@ -960,7 +1064,7 @@ def main(args):
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
+            dirs = os.listdir(output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
@@ -973,7 +1077,7 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(os.path.join(output_dir, path))
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -993,8 +1097,12 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
+                F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
+                conditioning_pixel_values = F1
+                pixel_values = F2
+
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -1009,9 +1117,9 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(input_ids)[0]
 
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                controlnet_image = conditioning_pixel_values.to(dtype=weight_dtype)
 
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
@@ -1058,7 +1166,7 @@ def main(args):
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = os.listdir(output_dir)
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
@@ -1073,10 +1181,10 @@ def main(args):
                                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    removing_checkpoint = os.path.join(output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
@@ -1104,25 +1212,49 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         controlnet = accelerator.unwrap_model(controlnet)
-        controlnet.save_pretrained(args.output_dir)
+        controlnet.save_pretrained(output_dir)
 
         if args.push_to_hub:
             save_model_card(
                 repo_id,
                 image_logs=image_logs,
                 base_model=args.pretrained_model_name_or_path,
-                repo_folder=args.output_dir,
+                repo_folder=output_dir,
             )
             upload_folder(
                 repo_id=repo_id,
-                folder_path=args.output_dir,
+                folder_path=output_dir,
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
 
     accelerator.end_training()
+    print("Done!")
 
 
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+
+
+
+### The command for running in HPC
+'''
+!accelerate launch train_controlnet_modified.py \
+ --pretrained_model_name_or_path="stabilityai/stable-diffusion-2-1-base" \
+ --train_data_dir="/work3/s204158/TextualInv_Train/Dataset/train" \
+ --resolution=512 \
+ --learning_rate=1e-5 \
+ --validation_image "/ValidationImages/1/F1.png" \
+ --validation_prompt "A man dancing in van gogh style, masterpiece" \
+ --train_batch_size=4 \
+ --num_train_epochs=3 \
+ --tracker_project_name="controlnet" \
+ --enable_xformers_memory_efficient_attention \
+ --checkpointing_steps=5000 \
+ --validation_steps=5000 \
+'''
+# --report_to wandb \
+
+
+# accelerate launch train_controlnet_modified.py --pretrained_model_name_or_path="stabilityai/stable-diffusion-2-1-base" --train_data_dir="/work3/s204158/TextualInv_Train/Dataset/train" --resolution=512 --learning_rate=1e-5 --validation_image "/ValidationImages/1/F1.png" --validation_prompt "A man dancing in van gogh style, masterpiece" --train_batch_size=4 --num_train_epochs=3 --tracker_project_name="controlnet" --enable_xformers_memory_efficient_attention --checkpointing_steps=5000 --validation_steps=5000 \
