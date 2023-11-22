@@ -52,11 +52,9 @@ from diffusers import (
     UniPCMultistepScheduler,
     StableDiffusionControlNetImg2ImgPipeline,
 )
-from diffusers.pipelines.controlnet.costume_pipeline_controlnet_img2img import CostumeStableDiffusionControlNetImg2ImgPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-from costumeControlNet import CostumeControlNetModel
 
 ### Disable this if you want no wandb
 wandb=False
@@ -85,7 +83,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
 
     controlnet = accelerator.unwrap_model(controlnet)
 
-    pipeline = CostumeStableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+    pipeline = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
         text_encoder=text_encoder,
@@ -114,20 +112,65 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     losses = []
     for index, batch in enumerate(validation_dataloader):
         F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
-        with torch.autocast("cuda"):
+        print(f"Validation shapes: F1: {F1.shape} - F2: {F2.shape} - Input_ids: {input_ids.shape}")
+        conditioning_pixel_values = F1.to("cuda")
+        pixel_values = F2.to("cuda")
+        input_ids = input_ids.to("cuda")
+
+        # Convert images to latent space
+        latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
+        latents = latents * vae.config.scaling_factor
+
+        # Sample noise that we'll add to the latents
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each image
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the text embedding for conditioning
+        encoder_hidden_states = text_encoder(input_ids)[0]
+
+        controlnet_image = conditioning_pixel_values.to(dtype=weight_dtype)
+
+        down_block_res_samples, mid_block_res_sample = controlnet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=controlnet_image,
+            return_dict=False,
+        )
+
+        # Predict the noise residual
+        model_pred = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_additional_residuals=[
+                sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+            ],
+            mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+        ).sample
+
+        # Get the target for loss depending on the prediction type
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
             
-            image = pipeline(
-                Raw_prompt[0], image=F1, control_image=torch.concatenate((F2, Of), dim=1), num_inference_steps=20, generator=generator
-            ).images[0]
-            validationImages.append(image)
-            img_array = np.array(image)
-            img_array = torch.from_numpy(img_array)
-            
-            loss = F.mse_loss(img_array, F2[0].permute(1, 2, 0), reduction="mean")
-            # loss = 0
-            losses.append(loss)
+
+        # loss = F.mse_loss(img_array, F2[0].permute(1, 2, 0), reduction="mean")
+        losses.append(loss)
         
-    '''
+    
     output_File = os.path.join(args.validation_outputFile, f"{step}.mp4")
 
 
@@ -144,7 +187,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         wandb.log({"Validation loss": np.mean(losses)})
     
     write_video(output_File, output_video_pytorch, fps=24)
-    '''
+
 
 
     if len(args.validation_image) == len(args.validation_prompt):
@@ -939,10 +982,10 @@ def main(args):
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = CostumeControlNetModel.from_pretrained(args.controlnet_model_name_or_path, cache_dir = "/work3/s204158/HF_cache")
+        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path, cache_dir = "/work3/s204158/HF_cache")
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = CostumeControlNetModel.from_unet(unet)
+        controlnet = ControlNetModel.from_unet(unet)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -966,7 +1009,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = CostumeControlNetModel.from_pretrained(input_dir, subfolder="controlnet", cache_dir = "/work3/s204158/HF_cache")
+                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet", cache_dir = "/work3/s204158/HF_cache")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -1177,8 +1220,9 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
-                conditioning_pixel_values = torch.concatenate((F2, Of), dim=1)
-                pixel_values = F1
+                print(f"Training shapes: F1: {F1.shape} - F2: {F2.shape} - Input_ids: {input_ids.shape}")
+                conditioning_pixel_values = F1
+                pixel_values = F2
 
                 # Convert images to latent space
                 latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()

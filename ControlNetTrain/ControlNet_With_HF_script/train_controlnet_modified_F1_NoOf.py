@@ -78,7 +78,7 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, validation_dataloader):
+def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, validation_dataloader, noise_scheduler):
     logger.info("Running validation... ")
 
     controlnet = accelerator.unwrap_model(controlnet)
@@ -113,13 +113,15 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     for index, batch in enumerate(validation_dataloader):
         F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
         with torch.autocast("cuda"):
+            
+            
             image = pipeline(
-                Raw_prompt[0], image=F2, control_image=F1, num_inference_steps=20, generator=generator
+                Raw_prompt[0], image=F1, control_image=F2, num_inference_steps=20, generator=generator
             ).images[0]
             validationImages.append(image)
             img_array = np.array(image)
             img_array = torch.from_numpy(img_array)
-
+            
             loss = F.mse_loss(img_array, F2[0].permute(1, 2, 0), reduction="mean")
             losses.append(loss)
         
@@ -1173,8 +1175,8 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
-                conditioning_pixel_values = F1
-                pixel_values = F2
+                conditioning_pixel_values = F2
+                pixel_values = F1
 
                 # Convert images to latent space
                 latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
@@ -1275,6 +1277,7 @@ def main(args):
                             weight_dtype,
                             global_step,
                             validation_dataloader=validation_dataloader,
+                            noise_scheduler=noise_scheduler,
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
