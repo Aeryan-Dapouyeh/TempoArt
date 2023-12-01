@@ -59,7 +59,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from costumeControlNet import CostumeControlNetModel
 
 ### Disable this if you want no wandb
-wandb=False
+wandb=True
 if wandb:
     import wandb
 
@@ -115,10 +115,14 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     for index, batch in enumerate(validation_dataloader):
         F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
         with torch.autocast("cuda"):
+
+            print(f"StyledImg has the shape {F1.shape}")
+            print(f"Control image has the shape {torch.concatenate((F1, Of), dim=1).shape}")
             
             image = pipeline(
-                Raw_prompt[0], image=F1, control_image=torch.concatenate((F2, Of), dim=1), num_inference_steps=20, generator=generator
+                Raw_prompt[0], image=F1, control_image=torch.concatenate((F1, Of), dim=1), num_inference_steps=20, generator=generator
             ).images[0]
+            ### Used to be image=F1, control_iamge=conc(F2, Of)
             validationImages.append(image)
             img_array = np.array(image)
             img_array = torch.from_numpy(img_array)
@@ -127,8 +131,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
             # loss = 0
             losses.append(loss)
         
-    '''
-    output_File = os.path.join(args.validation_outputFile, f"{step}.mp4")
+    
+    output_File = os.path.join(args.validation_outputFile, f"Of_F1_Model_{step}.mp4")
 
 
     output_video_pytorch = []
@@ -144,7 +148,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         wandb.log({"Validation loss": np.mean(losses)})
     
     write_video(output_File, output_video_pytorch, fps=24)
-    '''
+    
 
 
     if len(args.validation_image) == len(args.validation_prompt):
@@ -717,7 +721,7 @@ class ControlNetDataSet(Dataset):
             return_tensors="pt",
         ).input_ids[0]
 
-        F1 = self.preprocessImage(ImgPath=F1_path, Image_transforms=self.conditioning_image_transforms)
+        F1 = self.preprocessImage(ImgPath=F1_path, Image_transforms=self.image_transforms)
         F2 = self.preprocessImage(ImgPath=F2_path, Image_transforms=self.image_transforms)
         F1_Styled = self.preprocessImage(ImgPath=F1_Styled_path, Image_transforms=self.image_transforms)
         Of = self.preprocessImage(ImgPath=Of_path, Image_transforms=self.image_transforms)
@@ -1177,8 +1181,8 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
-                conditioning_pixel_values = torch.concatenate((F2, Of), dim=1)
-                pixel_values = F1
+                conditioning_pixel_values = torch.concatenate((F1, Of), dim=1)
+                pixel_values = F2
 
                 # Convert images to latent space
                 latents = vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
@@ -1263,7 +1267,7 @@ def main(args):
                                     removing_checkpoint = os.path.join(output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(output_dir, f"Of_F1_checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 

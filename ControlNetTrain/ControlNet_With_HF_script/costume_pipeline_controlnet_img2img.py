@@ -599,7 +599,8 @@ class CostumeStableDiffusionControlNetImg2ImgPipeline(
                     " the same length as the number of controlnets"
                 )
         else:
-            assert False
+            pass
+            # assert False
 
         if len(control_guidance_start) != len(control_guidance_end):
             raise ValueError(
@@ -919,11 +920,12 @@ class CostumeStableDiffusionControlNetImg2ImgPipeline(
         if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
             controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet.nets)
 
-        global_pool_conditions = (
-            controlnet.config.global_pool_conditions
-            if isinstance(controlnet, ControlNetModel)
-            else controlnet.nets[0].config.global_pool_conditions
-        )
+        # global_pool_conditions = (
+        #     controlnet.config.global_pool_conditions
+        #     if isinstance(controlnet, ControlNetModel)
+        #     else controlnet.nets[0].config.global_pool_conditions
+        # )
+        global_pool_conditions = controlnet.config.global_pool_conditions
         guess_mode = guess_mode or global_pool_conditions
 
         # 3. Encode input prompt
@@ -983,7 +985,8 @@ class CostumeStableDiffusionControlNetImg2ImgPipeline(
 
             control_image = control_images
         else:
-            assert False
+            pass
+            # assert False
 
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -1011,7 +1014,8 @@ class CostumeStableDiffusionControlNetImg2ImgPipeline(
                 1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
                 for s, e in zip(control_guidance_start, control_guidance_end)
             ]
-            controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
+            # controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
+            controlnet_keep.append(keeps[0])
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -1031,19 +1035,25 @@ class CostumeStableDiffusionControlNetImg2ImgPipeline(
                     control_model_input = latent_model_input
                     controlnet_prompt_embeds = prompt_embeds
 
-                if isinstance(controlnet_keep[i], list):
-                    cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-                else:
-                    controlnet_cond_scale = controlnet_conditioning_scale
-                    if isinstance(controlnet_cond_scale, list):
-                        controlnet_cond_scale = controlnet_cond_scale[0]
-                    cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                # if isinstance(controlnet_keep[i], list):
+                #     cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                # else:
+                #     controlnet_cond_scale = controlnet_conditioning_scale
+                #     if isinstance(controlnet_cond_scale, list):
+                #         controlnet_cond_scale = controlnet_cond_scale[0]
+                #     cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                controlnet_cond_scale = controlnet_conditioning_scale
+                if isinstance(controlnet_cond_scale, list):
+                    controlnet_cond_scale = controlnet_cond_scale[0]
+                cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
+                # Maybe change the dtype to torch.float16 if it doesn't work in the 
+                # training script
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    control_model_input,
+                    control_model_input.to(dtype=torch.float32).to("cuda"),
                     t,
-                    encoder_hidden_states=controlnet_prompt_embeds,
-                    controlnet_cond=control_image,
+                    encoder_hidden_states=controlnet_prompt_embeds.to(dtype=torch.float32).to("cuda"),
+                    controlnet_cond=control_image.to(dtype=torch.float32).to("cuda"),
                     conditioning_scale=cond_scale,
                     guess_mode=guess_mode,
                     return_dict=False,
