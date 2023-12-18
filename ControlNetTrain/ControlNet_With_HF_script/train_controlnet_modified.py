@@ -115,9 +115,6 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     for index, batch in enumerate(validation_dataloader):
         F1, F2, Of, F1_Styled, input_ids, Raw_prompt = batch
         with torch.autocast("cuda"):
-
-            print(f"StyledImg has the shape {F1.shape}")
-            print(f"Control image has the shape {torch.concatenate((F1, Of), dim=1).shape}")
             
             image = pipeline(
                 Raw_prompt[0], image=F1, control_image=torch.concatenate((F1, Of), dim=1), num_inference_steps=20, generator=generator
